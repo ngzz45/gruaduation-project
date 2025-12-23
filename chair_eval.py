@@ -62,6 +62,8 @@ def parse_args():
     parser.add_argument("--mask_ratio", type=float, default=0.99)
     parser.add_argument("--conv-mode", type=str, default="llava_v1")
 
+    parser.add_argument("--dynamic", action="store_true", help="dynamic steering")
+    parser.add_argument("--layers_range", nargs='+', type=int, default=None)
 
     return parser.parse_args()
 
@@ -127,7 +129,7 @@ def main(args):
         visual_direction = vti_vision[1:]
 
         # compute textual direction
-        vti_text, _ = obtain_textual_vti(
+        vti_text, textual_means_raw = obtain_textual_vti(
             model_loader.vlm_model,
             input_ids,
             input_images,
@@ -135,13 +137,26 @@ def main(args):
             model_type = args.model
         )
         textual_direction = vti_text[1:]
-
+        textual_means = textual_means_raw[1:]
+        if args.layers_range is not None:
+            args.layers_range = tuple(args.layers_range)
+        
         # add textual VTI to LLM
-        add_vti_layers(
-            model_loader.llm_model,
-            torch.stack([textual_direction], dim=1).cuda(),
-            alpha=[args.alpha_text]
-        )
+        if args.dynamic:
+            add_vti_layers(
+                model_loader.llm_model,
+                torch.stack([textual_direction], dim=1).cuda(),
+                alpha=[args.alpha_text],
+                target_means=textual_means.cuda(),
+                layers_range=args.layers_range
+            )
+        else:
+            add_vti_layers(
+                model_loader.llm_model,
+                torch.stack([textual_direction], dim=1).cuda(),
+                alpha=[args.alpha_text],
+                layers_range=args.layers_range
+            )
 
         # add visual VTI to vision encoder (note: follow original path)
         if args.model == 'llava-1.5':

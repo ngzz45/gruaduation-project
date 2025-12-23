@@ -53,6 +53,8 @@ def prepare_common_fileparts(args):
         file_parts.append(f"alpha_text_{args.alpha_text}")
         if args.dynamic:
             file_parts.append(f"dynamic")
+        if args.layers_range is not None:
+            file_parts.append(f"layers_range_{args.layers_range[0]}_{args.layers_range[1]}")
     else:
         file_parts.append("org")
 

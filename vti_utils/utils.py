@@ -306,46 +306,88 @@ def get_hiddenstates_blip(model, inputs, image_tensor):
     return h_all
 
 def obtain_textual_vti(model, inputs, image_tensor, model_type, rank=1):
-    # 1. 获取隐状态 (耗时操作，复用结果)
+    # 1. 获取隐状态 [Demos, Layers, Seq=Last, Dim]
     if model_type == "instructblip":
         hidden_states = get_hiddenstates_blip(model, inputs, image_tensor)
     else:
         hidden_states = get_hiddenstates(model, inputs, image_tensor)
     
-    hidden_states_all = []
-    pos_all = [] # 存储正样本状态
-
+    # 2. 准备数据容器
+    # hidden_states 是 list of tuples，我们需要整理成 Tensor
+    # 结构: [Demos, Layers, Dim]
+    
+    diff_all = [] # 存储 x_pos - x_neg
+    pos_all = []  # 存储 x_pos (用于计算 target_mean)
+    
     for i in range(len(hidden_states)):
-        # 差异向量: x_pos - x_neg (用于PCA)
-        diff = hidden_states[i][1].view(-1) - hidden_states[i][0].view(-1)
-        hidden_states_all.append(diff)
-        # 记录正样本状态 (用于计算 target_mean)
-        pos_all.append(hidden_states[i][1]) 
+        # hidden_states[i][0] 是 Neg, [1] 是 Pos
+        # view(-1) 会展平，我们要保持 Dim 维度
+        # 假设 hidden_states[i][1] shape 为 [Layers, Dim]
+        
+        pos = hidden_states[i][1]
+        neg = hidden_states[i][0]
+        
+        diff = pos - neg
+        
+        diff_all.append(diff)
+        pos_all.append(pos)
+        
+    # 堆叠成 Tensor: [Demos, Layers, Dim]
+    diff_tensor = torch.stack(diff_all) 
+    pos_tensor = torch.stack(pos_all)
+    
+    num_layers = diff_tensor.shape[1]
+    hidden_dim = diff_tensor.shape[2]
+    
+    directions = []
+    target_means = []
+    
+    # 3. 逐层计算 (Layer-wise Calculation)
+    print(f"Computing VTI vectors layer by layer (Total {num_layers} layers)...")
+    
+    for l in range(num_layers):
+        # 取出当前层的所有样本: [Demos, Dim]
+        layer_diff = diff_tensor[:, l, :].float()
+        layer_pos = pos_tensor[:, l, :].float()
+        
+        # --- 算法：PCA 与 Mean Diff 的平均 ---
+        
+        # A. 计算 Mean Difference (平均差向量)
+        mean_diff_vec = layer_diff.mean(dim=0).view(-1)
+        mean_diff_vec = F.normalize(mean_diff_vec, dim=-1) # 归一化
+        
+        # # B. 计算 PCA (主成分向量)
+        # pca = PCA(n_components=rank).to(layer_diff.device).fit(layer_diff)
+        # # pca.components_ shape: [1, Dim] -> 取 [0] 变成 [Dim]
+        # pca_vec = pca.components_[0].clone().view(-1)
+        # pca_vec = F.normalize(pca_vec, dim=-1)
+        
+        # # C. 检查方向一致性 (防止 PCA 方向反了)
+        # # 如果 PCA 和 Mean Diff 夹角超过 90度，翻转 PCA
+        # if torch.dot(mean_diff_vec, pca_vec) < 0:
+        #     pca_vec = -pca_vec
+            
+        # D. 平均两者
+        combined_vec = mean_diff_vec 
+        # combined_vec = F.normalize(combined_vec, dim=-1) # 再次归一化作为最终方向
+        
+        directions.append(combined_vec)
+        
+        # --- 计算当前层的 Target Mean ---
+        # 既然方向变了，Target Mean 必须基于新方向重新算
+        # layer_pos_norm = F.normalize(layer_pos, dim=-1)
+        # 投影: x · u
+        proj = torch.sum(layer_pos * combined_vec, dim=-1)
+        target_means.append(proj.mean())
 
-    # 2. 计算 PCA 主方向 (u)
-    fit_data = torch.stack(hidden_states_all)
-    pca = PCA(n_components=rank).to(fit_data.device).fit(fit_data.float())
+    # 4. 堆叠结果返回
+    # directions: [Layers, Dim]
+    # target_means: [Layers]
+    direction_stack = torch.stack(directions)
+    target_mean_stack = torch.stack(target_means)
     
-    # 原始方向向量 (Layers * Dim)
-    raw_direction = (pca.components_.sum(dim=1, keepdim=True) + pca.mean_).mean(0)
     
-    # 恢复形状 [Layers, Dim]
-    L, D = hidden_states[0][0].shape
-    direction = raw_direction.view(L, D)
-    reading_direction = fit_data.mean(0).view(L, D)
-
-    # 3. 计算目标投影均值 (\bar{z})
-    # Stack 正样本: [Batch, Layers, Dim]
-    pos_tensor = torch.stack(pos_all).to(direction.device).float()
-    
-    # 归一化方向向量 (投影需要单位向量)
-    u_hat = F.normalize(direction, dim=-1)
-    
-    # 计算投影: z = x_pos · u_hat -> [Batch, Layers]
-    # 对 Batch 维度求平均 -> [Layers]
-    target_mean = torch.sum(pos_tensor * u_hat, dim=-1).mean(dim=0)
-
-    return direction, reading_direction, target_mean
+    return direction_stack, target_mean_stack
 
 def average_tuples(tuples: List[Tuple[torch.Tensor]]) -> Tuple[torch.Tensor]:
     # Check that the input list is not empty

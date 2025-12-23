@@ -29,12 +29,12 @@ class VTILayer(nn.Module):
                     target = self.target_means[i]
                     diff = target - current_proj
 
-                    # 计算相对误差：(差值 / 目标值的绝对值)
-                    # 加上 1e-6 防止 target 为 0 (虽然你的数据里没 0，但保险起见)
-                    relative_diff = diff / (torch.abs(target) + 1e-6)
+                    
+                    # # 计算相对误差：(差值 / 目标值的绝对值)
+                    # relative_diff = diff / (torch.abs(target) + 1e-6)
 
-                    # 乘一个系数让它在 Sigmoid 敏感区，比如 2.0 或 5.0
-                    lambda_sim = torch.sigmoid(diff)
+                    lambda_sim = torch.clamp(diff, min=0, max=1.0)
+                    # print(f"Layer lambda_sim: {diff.mean().item()}")
                 else:
                     lambda_sim = 1.0 
 
@@ -47,11 +47,34 @@ class VTILayer(nn.Module):
             y = y / len(self.vti_direction)
             # 注入干预并归一化
             x = F.normalize(F.normalize(x.float(), dim=-1) + 0.1 * y, dim=-1) * norm
-                
+            # x = x.float() + y
+
             return x.half()
         else:
             return x
 
+class VTIBlockWrapper(nn.Module):
+    def __init__(self, original_layer, vti_layer):
+        super().__init__()
+        self.original_layer = original_layer
+        self.vti_layer = vti_layer # 这就是你之前写的 VTILayer 实例
+
+    def forward(self, *args, **kwargs):
+        # 1. 先让原始 Block 跑完，拿到结果
+        # outputs 通常是 tuple: (hidden_states, self_attentions, ...)
+        outputs = self.original_layer(*args, **kwargs)
+        
+        # 2. 取出残差流 (Hidden States)
+        # 它是 Block 的最终输出，也就是下一层的输入
+        hidden_states = outputs[0]
+        
+        # 3. 在残差流上应用 VTI 干预
+        # 此时传入 vti_layer 的 x 就是真正的 residual stream vector
+        hidden_states = self.vti_layer(hidden_states)
+        
+        # 4. 把修改后的 hidden_states 塞回 tuple
+        # 保持输出格式与原始模型一致，防止报错
+        return (hidden_states,) + outputs[1:]
 
 def get_nested_attr(obj, attr_path):
     attrs = attr_path.split(".")
@@ -141,20 +164,28 @@ def add_vti_layers(model: PreTrainedModel, vti_directions: Tensor, alpha: list, 
     for i, layer in enumerate(layers):
 
         if layers_range is not None:
-            if i < layers_range[0] or i > layers_range[1]:
+            if i+1 < layers_range[0] or i+1 > layers_range[1]:
                 continue
-
-        original_mlp = find_module(layer, mlp_keywords)
+ 
         
         current_mean = None
         if target_means is not None:
             # target_means[i] 取出来是标量 (0-dim) 我们用 .view(1) 把它变回 [1] 的形状 (1-dim)
             current_mean = target_means[i].view(1) 
-        
-        layer.mlp = nn.Sequential(
-            original_mlp, 
-            VTILayer(vti_directions[i], alpha, target_means=current_mean)
+            
+        vti_layer_instance = VTILayer(
+            vti_directions[i], 
+            alpha, 
+            target_means=current_mean
         )
+        
+        # original_mlp = find_module(layer, mlp_keywords)        
+        # layer.mlp = nn.Sequential(
+        #     original_mlp, 
+        #     vti_layer_instance
+        # )
+
+        layers[i] = VTIBlockWrapper(layer, vti_layer_instance)
 
 def remove_vti_layers(model: PreTrainedModel):
     layers = get_layers(model)
